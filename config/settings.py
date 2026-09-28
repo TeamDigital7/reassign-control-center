@@ -136,6 +136,7 @@ DEFAULT_PARAMS = {
     "stock_seguridad_global": "0",
     "reserva_por_tienda": "1",
     "ordenar_por_stock": "SI",
+    "opciones_alternativas": "1",
     "max_unidades_por_tienda": "0",
     "columna_salida": COL_REASSIGNED,
 }
@@ -173,5 +174,12 @@ PARAM_HELP = {
         "NO = gana la primera de la lista."
     ),
     "max_unidades_por_tienda": "Tope de unidades reasignadas por tienda en una corrida. 0 = sin tope.",
+    "opciones_alternativas": (
+        "Cuantas tiendas de respaldo se informan por pedido, ademas de la elegida. "
+        "Sirve cuando la primera tienda rechaza el pedido y hay que reasignarlo a "
+        "mano sin volver a correr la app. Solo entran tiendas que cubren el pedido "
+        "entero. No se les reserva stock: se informa cuantas unidades tenian al "
+        "momento del calculo. 0 desactiva la columna; el maximo es 3."
+    ),
     "columna_salida": "Nombre exacto de la columna donde se escribe la tienda reasignada.",
 }

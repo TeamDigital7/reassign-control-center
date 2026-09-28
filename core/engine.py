@@ -50,6 +50,42 @@ PREVIEW_COLUMNS = [
     "Resultado",
 ]
 
+# --- Opciones alternativas --------------------------------------------------
+# Cuando la tienda elegida rechaza el pedido, quien lo gestiona necesita a
+# donde mandarlo sin volver a correr la app. Se informan las siguientes
+# tiendas de la lista de prioridad que **tambien** podrian cubrirlo entero.
+#
+# No se les reserva stock a proposito: reservarlo dejaria unidades sin usar en
+# cada corrida. Por eso se muestra cuantas unidades tenia cada una al momento
+# del calculo, para que la decision se tome con el dato a la vista.
+MAX_ALTERNATIVES = 3
+ORDINALES = {2: "2da", 3: "3ra", 4: "4ta"}
+
+
+def alternative_labels(count: int) -> list[str]:
+    """`['2da', '3ra', ...]` para las columnas de opciones alternativas."""
+    return [ORDINALES[posicion] for posicion in range(2, 2 + max(0, count))]
+
+
+def alternative_columns(count: int) -> list[str]:
+    """Columnas del detalle que describen las opciones alternativas."""
+    columnas: list[str] = []
+    for etiqueta in alternative_labels(count):
+        columnas += [f"{etiqueta} opcion", f"Stock {etiqueta} opcion"]
+    return columnas
+
+
+def alternative_trace_columns(count: int) -> list[str]:
+    """Columnas de trazabilidad del Excel para las opciones alternativas."""
+    columnas: list[str] = []
+    for etiqueta in alternative_labels(count):
+        columnas += [
+            f"Reasig_{etiqueta}_Opcion",
+            f"Reasig_Cod_{etiqueta}_Opcion",
+            f"Reasig_Stock_{etiqueta}_Opcion",
+        ]
+    return columnas
+
 
 @dataclass
 class KPIs:
@@ -155,6 +191,86 @@ def _is_origin(rule: StoreRule, origin_code: str, origin_name: str) -> bool:
     return False
 
 
+def _candidates(
+    rules: list[StoreRule],
+    sku: str,
+    origin_code: str,
+    origin_name: str,
+    ledger: _Ledger,
+    exclude_origin: bool,
+    sort_by_stock: bool,
+) -> tuple[list[tuple[StoreRule, int]], bool]:
+    """Tiendas con stock para el SKU, ya ordenadas. Devuelve `(lista, salto_origen)`.
+
+    Se extrajo de `_pick_store` para que la eleccion de la tienda y el calculo
+    de las opciones alternativas miren exactamente la misma lista: si una
+    usara otro criterio, la segunda opcion podria no ser una tienda que la
+    primera pasada hubiera aceptado.
+    """
+    candidatas: list[tuple[StoreRule, int]] = []
+    skipped_origin = False
+
+    for rule in rules:
+        if exclude_origin and _is_origin(rule, origin_code, origin_name):
+            skipped_origin = True
+            continue
+        cap_restante = None
+        if rule.max_unidades:
+            cap_restante = rule.max_unidades - ledger.store_used(rule.cod_tienda)
+            if cap_restante <= 0:
+                continue
+
+        available = ledger.available(sku, rule.cod_tienda, rule.stock_seguridad)
+        if cap_restante is not None:
+            available = min(available, cap_restante)
+        if available > 0:
+            candidatas.append((rule, available))
+
+    if sort_by_stock:
+        # `sorted` es estable: ante misma banda y mismo stock se conserva el
+        # orden original de la lista de prioridad.
+        candidatas.sort(key=lambda item: (item[0].prioridad, -item[1]))
+    return candidatas, skipped_origin
+
+
+def alternative_stores(
+    rules: list[StoreRule],
+    sku: str,
+    units: int,
+    origin_code: str,
+    origin_name: str,
+    ledger: _Ledger,
+    exclude_origin: bool,
+    sort_by_stock: bool,
+    chosen: StoreRule | None,
+    count: int,
+) -> list[tuple[StoreRule, int]]:
+    """Siguientes tiendas que podrian cubrir el mismo pedido entero.
+
+    Solo entran las que cubren las `units` completas: una tienda que cubre la
+    mitad no sirve como plan B para quien esta gestionando el rechazo.
+
+    Se calcula **antes** de que la tienda elegida tome su stock, pero eso no
+    altera el resultado: la elegida se excluye y el descuento no toca a las
+    demas. Lo que si refleja es lo ya comprometido por los pedidos anteriores
+    de la misma corrida.
+    """
+    if count <= 0 or chosen is None or not rules:
+        return []
+    candidatas, _ = _candidates(
+        rules, sku, origin_code, origin_name, ledger, exclude_origin, sort_by_stock
+    )
+    alternativas: list[tuple[StoreRule, int]] = []
+    for rule, available in candidatas:
+        if len(alternativas) >= count:
+            break
+        if rule.cod_tienda and rule.cod_tienda == chosen.cod_tienda:
+            continue
+        if available >= units:
+            alternativas.append((rule, available))
+    return alternativas
+
+
 def _pick_store(
     rules: list[StoreRule],
     sku: str,
@@ -183,24 +299,9 @@ def _pick_store(
     if not rules:
         return None, 0, 0, "El sitio/marca no tiene tiendas en la lista de prioridad."
 
-    candidatas: list[tuple[StoreRule, int]] = []
-    skipped_origin = False
-
-    for rule in rules:
-        if exclude_origin and _is_origin(rule, origin_code, origin_name):
-            skipped_origin = True
-            continue
-        cap_restante = None
-        if rule.max_unidades:
-            cap_restante = rule.max_unidades - ledger.store_used(rule.cod_tienda)
-            if cap_restante <= 0:
-                continue
-
-        available = ledger.available(sku, rule.cod_tienda, rule.stock_seguridad)
-        if cap_restante is not None:
-            available = min(available, cap_restante)
-        if available > 0:
-            candidatas.append((rule, available))
+    candidatas, skipped_origin = _candidates(
+        rules, sku, origin_code, origin_name, ledger, exclude_origin, sort_by_stock
+    )
 
     if not candidatas:
         reason = (
@@ -210,11 +311,6 @@ def _pick_store(
         if skipped_origin:
             reason += " Se descarto la tienda de origen."
         return None, 0, 0, reason
-
-    if sort_by_stock:
-        # `sorted` es estable: ante misma banda y mismo stock se conserva el
-        # orden original de la lista de prioridad.
-        candidatas.sort(key=lambda item: (item[0].prioridad, -item[1]))
 
     # Pasada 1: la tienda conserva `reserva` unidades despues de ceder.
     if reserva > 0:
@@ -269,6 +365,9 @@ def reassign(
     group_fallback = config.flag("fallback_linea_si_grupo_falla")
     reserva = max(0, config.number("reserva_por_tienda", 1))
     sort_by_stock = config.flag("ordenar_por_stock")
+    n_alternativas = min(MAX_ALTERNATIVES, max(0, config.number("opciones_alternativas", 1)))
+    cols_alternativas = alternative_columns(n_alternativas)
+    trace_alternativas = alternative_trace_columns(n_alternativas)
     target_statuses = set(config.target_statuses)
 
     col_status = resolved[settings.COL_STATUS]
@@ -295,7 +394,7 @@ def reassign(
     else:
         output[output_column] = output[output_column].map(as_text).astype(object)
 
-    for column in settings.TRACE_COLUMNS:
+    for column in settings.TRACE_COLUMNS + trace_alternativas:
         output[column] = _blank_column()
         if include_trace and column not in output_headers:
             output_headers.append(column)
@@ -380,6 +479,8 @@ def reassign(
             "Stock restante": "",
             "Detalle": "",
         }
+        for columna in cols_alternativas:
+            record[columna] = ""
 
         if not sku:
             record["Resultado"] = settings.RESULT_ERROR
@@ -431,6 +532,22 @@ def reassign(
             detail_rows.append(record)
             continue
 
+        # Antes de tomar el stock: la elegida se excluye igual, y asi las
+        # unidades informadas son las que habia al momento de decidir.
+        alternativas = alternative_stores(
+            config.rules_for(site, brand), sku, units, origin_code, origin_name,
+            ledger, exclude_origin, sort_by_stock, rule, n_alternativas,
+        )
+        for posicion, etiqueta in enumerate(alternative_labels(n_alternativas)):
+            if posicion >= len(alternativas):
+                break
+            alterna, disponible = alternativas[posicion]
+            record[f"{etiqueta} opcion"] = alterna.nom_tienda or alterna.cod_tienda
+            record[f"Stock {etiqueta} opcion"] = disponible
+            output.at[index, f"Reasig_{etiqueta}_Opcion"] = alterna.nom_tienda
+            output.at[index, f"Reasig_Cod_{etiqueta}_Opcion"] = alterna.cod_tienda
+            output.at[index, f"Reasig_Stock_{etiqueta}_Opcion"] = disponible
+
         ledger.take(sku, rule.cod_tienda, take)
         remaining = ledger.available(sku, rule.cod_tienda, rule.stock_seguridad)
         partial = take < units
@@ -468,7 +585,8 @@ def reassign(
         output.at[index, "Reasig_Resultado"] = settings.RESULT_NOT_APPLICABLE
 
     detail = pd.DataFrame(detail_rows) if detail_rows else pd.DataFrame(columns=PREVIEW_COLUMNS)
-    preview = detail[PREVIEW_COLUMNS] if not detail.empty else detail
+    columnas_preview = PREVIEW_COLUMNS + [c for c in cols_alternativas if c in detail.columns]
+    preview = detail[columnas_preview] if not detail.empty else detail
 
     store_summary = ledger.snapshot()
     if not store_summary.empty:
@@ -477,7 +595,8 @@ def reassign(
         kpis.tiendas_usadas = len(store_summary)
 
     if not include_trace:
-        output_headers = [h for h in output_headers if h not in settings.TRACE_COLUMNS]
+        descartables = set(settings.TRACE_COLUMNS) | set(trace_alternativas)
+        output_headers = [h for h in output_headers if h not in descartables]
 
     return ReassignmentResult(
         output_df=output,

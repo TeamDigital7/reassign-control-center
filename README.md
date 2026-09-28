@@ -52,6 +52,12 @@ Subir archivo -> Validar -> Consultar BigQuery -> Reasignar -> Revisar -> Descar
    veces el mismo par (SKU, tienda).
 7. Nunca reasigna a la tienda de origen del propio pedido.
 8. Marca `SIN OPCION DE REASIGNACION` cuando ninguna tienda alcanza.
+8b. Informa una **2da opcion**: la siguiente tienda de la prioridad que tambien
+   podria cubrir el pedido entero. Sirve para cuando la tienda elegida ya
+   rechazo el pedido y hay que reasignarlo a mano sin volver a correr la app.
+   **No se le reserva stock** — reservarlo dejaria unidades sin usar en cada
+   corrida —, por eso se informa cuantas unidades tenia al momento del
+   calculo: si dice 1, esa unidad la puede tomar un solo pedido.
 9. Genera el Excel final con las columnas originales intactas y la tienda escrita
    en `Nom Tda Reasignada` (la crea si el archivo no la trae).
 
@@ -165,6 +171,7 @@ python -m scripts.import_priority "ruta\Priorizacion Tiendas.xlsx"
 | `stock_seguridad_global` | `0` | unidades intocables en todas las tiendas |
 | `reserva_por_tienda` | `1` | unidades que la tienda deberia conservar tras ceder; `0` desactiva |
 | `ordenar_por_stock` | `SI` | dentro de la misma banda gana la tienda con mas stock |
+| `opciones_alternativas` | `1` | tiendas de respaldo que se informan por pedido (0 a 3) |
 | `max_unidades_por_tienda` | `0` | tope por tienda y corrida (`0` = sin tope) |
 | `columna_salida` | `Nom Tda Reasignada` | nombre exacto de la columna destino |
 
@@ -218,6 +225,9 @@ Excel no se genera y se explica el motivo.
 
 Las columnas de trazabilidad (`Reasig_*`) son **opcionales**: desactivadas, el Excel
 de carga queda con exactamente las columnas originales mas la de reasignacion.
+Entre ellas viajan `Reasig_2da_Opcion`, `Reasig_Cod_2da_Opcion` y
+`Reasig_Stock_2da_Opcion` con la tienda de respaldo; en el reporte operativo las
+mismas columnas salen como `2da opcion` y `Stock 2da opcion`.
 
 ---
 
