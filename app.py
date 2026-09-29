@@ -327,6 +327,44 @@ def step_validate(config) -> None:
         st.dataframe(priority_to_frame(config), width="stretch", hide_index=True, height=220)
 
 
+def _positional_limit(target) -> int:
+    """Cuantos argumentos posicionales acepta `target`."""
+    import inspect
+
+    try:
+        parametros = inspect.signature(target).parameters.values()
+    except (TypeError, ValueError):  # pragma: no cover - builtins raros
+        return 99
+    return sum(
+        1
+        for p in parametros
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        and p.name not in ("self", "cls")
+    )
+
+
+def call_compat(target, *args):
+    """Llama a `target` recortando los argumentos que su version no acepta.
+
+    La app se despliega a veces archivo por archivo, y Streamlit re-ejecuta el
+    script principal en cada interaccion pero **conserva en memoria los
+    modulos ya importados**. Puede quedar entonces un `app.py` nuevo llamando
+    a un `core/` viejo, y la corrida se cae con un TypeError de argumentos que
+    no le dice nada a quien la usa.
+
+    Recortar de mas es seguro: los argumentos que se pierden son siempre los
+    ultimos, que son opcionales y tienen un default razonable. Se pierde la
+    funcionalidad nueva, no la corrida; `stale_modules` avisa aparte.
+    """
+    limite = _positional_limit(target)
+    return target(*args[:limite])
+
+
+def stale_modules() -> bool:
+    """`True` si `core/` quedo en una version anterior a la de este `app.py`."""
+    return _positional_limit(secrets_to_source) < 4
+
+
 def step_stock(config, mode: str) -> None:
     payload = st.session_state["payload"]
     report = st.session_state["report"]
@@ -381,11 +419,22 @@ def step_stock(config, mode: str) -> None:
     central_codes = config.param("codigos_bodega_central")
     formula_central = config.param("formula_bodega_central")
 
+    if stale_modules():
+        ui.note(
+            "warn",
+            "La app esta corriendo una version mezclada",
+            "El script principal se actualizo pero los modulos de `core/` siguen en "
+            "memoria con la version anterior. Reinicia la app (en Streamlit Cloud: "
+            "Manage app -> Reboot) para que tome todo el codigo nuevo. Mientras "
+            "tanto se sigue adelante con lo que el modulo viejo acepta.",
+        )
+
     try:
         with st.spinner("Consultando stock..."):
             if mode.startswith("BigQuery"):
-                source = secrets_to_source(
-                    bigquery_secrets(), include_central, central_codes, formula_central
+                source = call_compat(
+                    secrets_to_source, bigquery_secrets(), include_central,
+                    central_codes, formula_central,
                 )
                 stock = source.fetch(skus)
             else:
@@ -393,8 +442,9 @@ def step_stock(config, mode: str) -> None:
                 if not cached:
                     raise ValueError("Sube un archivo de stock en la barra lateral.")
                 frame = excel_io.read_stock_file(cached[0], cached[1])
-                stock = ManualStockSource(
-                    frame, include_central, tuple(central_codes.split(",")), formula_central
+                stock = call_compat(
+                    ManualStockSource, frame, include_central,
+                    tuple(central_codes.split(",")), formula_central,
                 ).fetch(skus)
     except Exception as exc:
         st.session_state["stock_error"] = str(exc)
