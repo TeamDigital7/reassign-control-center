@@ -29,6 +29,7 @@ from core.stock_source import (
     build_stock_index,
     build_stock_query,
     central_warehouse_codes,
+    classify_reserve_columns,
     consolidate,
     stock_coverage,
     stock_cutoff,
@@ -147,7 +148,7 @@ def test_consolidate_directo():
     assert build_stock_index(out) == {("A", "59"): 7, ("A", "88"): 1}
 
 
-@case("Bodega central: 320 suma su stock_bodega y una tienda fisica no")
+@case("Bodega central: el disponible es su stock_bodega; la tienda usa el suyo")
 def test_bodega_central():
     datos = archivo(
         [
@@ -157,7 +158,10 @@ def test_bodega_central():
     )
     stock = ManualStockSource(datos, True).fetch(["A"])
     index = build_stock_index(stock)
-    assert index == {("A", "320"): 10, ("A", "59"): 1}, index
+    # En una bodega central manda `stock_bodega` (9), no la suma con el piso.
+    # En una tienda fisica manda `stock_tiendas` (1) y `stock_bodega` es otro
+    # almacen que no se despacha desde ahi.
+    assert index == {("A", "320"): 9, ("A", "59"): 1}, index
 
 
 @case("Bodega central: se puede declarar mas de una sin tocar codigo")
@@ -165,9 +169,11 @@ def test_bodegas_centrales_configurables():
     assert central_warehouse_codes() == {"320"}
     assert central_warehouse_codes("320, 400") == {"320", "400"}
     datos = archivo([{"sku": "A", "cod_tienda": "400", "stock_tiendas": 1, "stock_bodega": 9}])
+    # Sin declararla, la 400 es una tienda fisica: solo cuenta su piso.
     assert build_stock_index(ManualStockSource(datos, True).fetch(["A"])) == {("A", "400"): 1}
+    # Declarada como central, cuenta su bodega.
     con_400 = ManualStockSource(datos, True, ("320", "400")).fetch(["A"])
-    assert build_stock_index(con_400) == {("A", "400"): 10}
+    assert build_stock_index(con_400) == {("A", "400"): 9}
 
 
 @case("Negativos: se suman antes de aplicar el piso en cero")
@@ -232,6 +238,102 @@ def test_cutoff_dd_mm_yyyy():
         True,
     ).fetch(["A"])
     assert stock_cutoff(stock) == "20/08/2026", stock.to_dict("records")
+
+
+@case("Formula de bodega central: sumar, solo_bodega y restar_tiendas")
+def test_formula_bodega_central():
+    # Cual corresponde depende de como modela el origen los dos almacenes;
+    # por eso se elige en la hoja Parametros y no esta fija en el codigo.
+    datos = pd.DataFrame(
+        [
+            {"sku": "A", "cod_tienda": "320", "stock_tiendas": 30, "stock_bodega": 100,
+             "fecha_corte": "2026-09-03"},
+        ]
+    )
+    def disponible(modo):
+        stock = ManualStockSource(datos, True, ("320",), modo).fetch(["A"])
+        return int(stock.loc[0, "stock"])
+
+    assert disponible("solo_bodega") == 100
+    assert disponible("sumar") == 130
+    assert disponible("restar_tiendas") == 70
+    # Un valor desconocido no rompe: cae en el default.
+    assert disponible("cualquier_cosa") == 100
+
+
+@case("La formula solo aplica a la bodega central, nunca a una tienda fisica")
+def test_formula_no_toca_tienda_fisica():
+    datos = pd.DataFrame(
+        [
+            {"sku": "A", "cod_tienda": "59", "stock_tiendas": 4, "stock_bodega": 77,
+             "fecha_corte": "2026-09-03"},
+        ]
+    )
+    for modo in ("sumar", "solo_bodega", "restar_tiendas"):
+        stock = ManualStockSource(datos, True, ("320",), modo).fetch(["A"])
+        assert int(stock.loc[0, "stock"]) == 4, (modo, stock.to_dict("records"))
+
+
+@case("Reservas: cada almacen descuenta la columna de reserva que le toca")
+def test_reservas_por_almacen():
+    datos = archivo(
+        [
+            {"sku": "A", "cod_tienda": "320", "stock_tiendas": 30, "stock_bodega": 100,
+             "reserva_tiendas": 5, "reserva_bodega": 40},
+            {"sku": "A", "cod_tienda": "59", "stock_tiendas": 10, "stock_bodega": 77,
+             "reserva_tiendas": 3, "reserva_bodega": 50},
+        ]
+    )
+    index = build_stock_index(ManualStockSource(datos, True).fetch(["A"]))
+    # 320 es central: 100 de bodega menos 40 reservados.
+    # 59 es tienda: 10 de piso menos 3 reservados; su bodega no se toca.
+    assert index == {("A", "320"): 60, ("A", "59"): 7}, index
+
+
+@case("Reservas: una reserva sin apellido aplica al almacen que use la fila")
+def test_reserva_generica():
+    datos = archivo(
+        [
+            {"sku": "B", "cod_tienda": "320", "stock_tiendas": 0, "stock_bodega": 50,
+             "reserva": 20},
+            {"sku": "B", "cod_tienda": "59", "stock_tiendas": 8, "stock_bodega": 0,
+             "reserva": 3},
+        ]
+    )
+    index = build_stock_index(ManualStockSource(datos, True).fetch(["B"]))
+    assert index == {("B", "320"): 30, ("B", "59"): 5}, index
+
+
+@case("Reservas: se reconocen por el encabezado, no por un nombre fijo")
+def test_reservas_por_encabezado():
+    de_tiendas, de_bodega = classify_reserve_columns(
+        ["id_producto", "stock_tiendas", "stock_bodega", "reserva_tiendas",
+         "reserva_bodega", "reserva", "Stock_Reservado_Tienda", "fecha_corte"]
+    )
+    assert de_tiendas == ["reserva_tiendas", "reserva", "Stock_Reservado_Tienda"], de_tiendas
+    assert de_bodega == ["reserva_bodega", "reserva"], de_bodega
+    # Una tabla sin columnas de reserva no resta nada.
+    assert classify_reserve_columns(["sku", "stock_bodega"]) == ([], [])
+
+
+@case("Reservas: una reserva mayor que el stock no deja el disponible negativo")
+def test_reserva_mayor_que_stock():
+    datos = archivo([{"sku": "C", "cod_tienda": "59", "stock_tiendas": 2, "reserva_tiendas": 9}])
+    stock = ManualStockSource(datos, True).fetch(["C"])
+    assert int(stock.loc[0, "stock"]) == 0, stock.to_dict("records")
+    assert build_stock_index(stock) == {}
+
+
+@case("Reservas: la consulta de BigQuery las descuenta dentro del SQL")
+def test_reservas_en_el_sql():
+    columnas = ["id_producto", "codigo_tienda", "stock_tiendas", "stock_bodega",
+                "reserva_tiendas", "reserva_bodega", "fecha_corte"]
+    consulta = build_stock_query("p.d.t", columnas)
+    assert "s.reserva_tiendas" in consulta, consulta
+    assert "s.reserva_bodega" in consulta, consulta
+    # Sin conocer las columnas, la consulta no inventa restas.
+    simple = build_stock_query("p.d.t")
+    assert "reserva" not in simple, simple
 
 
 def main() -> int:

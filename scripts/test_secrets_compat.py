@@ -21,9 +21,11 @@ from config import settings
 from core.stock_source import (
     ManualStockSource,
     _finalize,
+    build_stock_query,
     is_bigquery_configured,
     resolve_stock_table,
     secrets_to_source,
+    sku_variants,
 )
 
 # Bloque [bigquery] tal como vive en Catalogo Control Center.
@@ -116,8 +118,9 @@ def test_query_schema_aliases():
     assert out.loc[0, "cod_tienda"] == "151"
     # En tienda solo cuenta el stock de sala...
     assert out.loc[0, "stock"] == 3
-    # ...y en la bodega central 320 se suma el de bodega.
-    assert out.loc[1, "stock"] == 5
+    # ...y en la bodega central 320 cuenta su propio stock_bodega (4), no la
+    # suma con el piso: son la misma mercaderia contada dos veces.
+    assert out.loc[1, "stock"] == 4
 
 
 @case("Una consulta sin las columnas minimas falla con un mensaje claro")
@@ -136,6 +139,30 @@ def test_manual_source():
     raw = pd.DataFrame([{"sku": "5438957", "cod_tienda": "59", "stock": 2}])
     out = ManualStockSource(raw, include_central_warehouse=True).fetch(["5438957"])
     assert len(out) == 1 and out.loc[0, "stock"] == 2
+
+
+@case("Una consulta propia recibe tambien las variantes crudas del SKU")
+def test_variantes_para_consulta_propia():
+    # Una consulta propia se ejecuta tal cual. Si compara el valor crudo
+    # (`5438957.0` de un FLOAT, `0005438957` de un texto) contra el SKU ya
+    # normalizado, no devuelve nada. Mandar las variantes arregla ese cruce
+    # sin reescribir la consulta del usuario.
+    variantes = sku_variants("5438957")
+    assert "5438957" in variantes
+    assert "5438957.0" in variantes
+    assert "0005438957" in variantes
+    # Un codigo alfanumerico no se toca: inventar variantes no tendria sentido.
+    assert sku_variants("ABC-12") == ["ABC-12"]
+    assert sku_variants("") == []
+
+
+@case("La consulta propia del repo solo necesita el SKU canonico")
+def test_sin_variantes_en_la_consulta_del_repo():
+    # La consulta del repo canoniza los dos lados dentro de BigQuery, asi que
+    # mandar variantes seria ruido.
+    consulta = build_stock_query("p.d.t")
+    assert "sku IN UNNEST(@skus)" in consulta
+    assert "REGEXP_REPLACE(UPPER(TRIM(CAST(s.id_producto AS STRING)))" in consulta
 
 
 def main() -> int:

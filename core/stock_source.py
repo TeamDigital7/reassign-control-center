@@ -40,23 +40,89 @@ SKU_CANONICO_SQL = (
     "{column})"
 )
 
+# --- Reservas ---------------------------------------------------------------
+# El disponible real de un almacen es su stock MENOS lo reservado. Las columnas
+# de reserva no tienen un nombre fijo en el origen, asi que se reconocen por el
+# encabezado: cualquier columna que diga "reserva".
+#
+# Se reparten por lo que nombre el propio encabezado: si menciona bodega resta
+# de bodega, si menciona tienda resta de tiendas, y una reserva sin apellido
+# resta de las dos. Eso ultimo es seguro porque en cada fila solo se usa uno de
+# los dos almacenes: en una bodega central manda `stock_bodega` y en una tienda
+# fisica manda `stock_tiendas`.
+RESERVE_HINT = "reserva"
+
+
+def classify_reserve_columns(names: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Devuelve `(reservas_de_tiendas, reservas_de_bodega)` segun el encabezado."""
+    de_tiendas: list[str] = []
+    de_bodega: list[str] = []
+    for name in names:
+        texto = as_text(name).strip().lower()
+        if RESERVE_HINT not in texto:
+            continue
+        menciona_bodega = "bodega" in texto or "almacen" in texto
+        menciona_tienda = "tienda" in texto or "local" in texto
+        if menciona_bodega and not menciona_tienda:
+            de_bodega.append(name)
+        elif menciona_tienda and not menciona_bodega:
+            de_tiendas.append(name)
+        else:
+            # Sin apellido (o con los dos): aplica al almacen que use la fila.
+            de_tiendas.append(name)
+            de_bodega.append(name)
+    return de_tiendas, de_bodega
+
+
+def _net_sql(base_column: str, reserves: Iterable[str]) -> str:
+    """`unidades(base) - unidades(reserva1) - ...` en SQL."""
+    expresion = UNIDADES_SQL.format(column=base_column)
+    for reserve in reserves:
+        expresion += f" - {UNIDADES_SQL.format(column=reserve)}"
+    return expresion
+
+
+# --- Corte y unidades dentro de BigQuery ------------------------------------
+# El corte se compara por DIA, no por instante. `fecha_corte` puede ser una
+# marca de tiempo, y entonces `MAX(fecha_corte)` es un **instante**: si el ETL
+# sella cada lote con su propia hora, unir por igualdad se queda con una
+# rebanada minima de la foto (o con nada) y la app aparece sin stock aunque la
+# tabla lo tenga. `DIA_CORTE_SQL` sirve para DATE, DATETIME, TIMESTAMP y texto
+# ISO por igual.
+DIA_CORTE_SQL = (
+    "COALESCE("
+    "SAFE_CAST(CAST({column} AS STRING) AS DATE), "
+    "SAFE_CAST(LEFT(CAST({column} AS STRING), 10) AS DATE)"
+    ")"
+)
+
+# Las unidades pasan por FLOAT64 antes de INT64: un `CAST('3.0' AS INT64)`
+# directo **falla** en BigQuery y tumba la consulta entera si la columna llega
+# como texto.
+UNIDADES_SQL = "CAST(COALESCE(SAFE_CAST(CAST({column} AS STRING) AS FLOAT64), 0) AS INT64)"
+
 # Consulta parametrizada. Se filtra por SKU para no traer la tabla completa y
-# se toma unicamente la ultima `fecha_corte` disponible.
+# se toma unicamente el ultimo dia de `fecha_corte` disponible.
 STOCK_QUERY = """
-WITH ultimo_corte AS (
-  SELECT MAX(fecha_corte) AS fecha_corte
-  FROM `{table}`
+WITH con_dia AS (
+  SELECT
+    {sku_limpio}                     AS sku_limpio,
+    CAST(s.codigo_tienda AS STRING)  AS cod_tienda,
+    {neto_tiendas}                   AS stock_tiendas,
+    {neto_bodega}                    AS stock_bodega,
+    CAST(s.fecha_corte AS STRING)    AS fecha_corte,
+    {dia_corte}                      AS dia_corte
+  FROM `{table}` AS s
+),
+ultimo_corte AS (
+  SELECT MAX(dia_corte) AS dia_corte
+  FROM con_dia
 ),
 corte_vigente AS (
-  SELECT
-    {sku_limpio}                                AS sku_limpio,
-    CAST(s.codigo_tienda AS STRING)             AS cod_tienda,
-    COALESCE(CAST(s.stock_tiendas AS INT64), 0) AS stock_tiendas,
-    COALESCE(CAST(s.stock_bodega  AS INT64), 0) AS stock_bodega,
-    CAST(s.fecha_corte AS STRING)               AS fecha_corte
-  FROM `{table}` AS s
+  SELECT c.sku_limpio, c.cod_tienda, c.stock_tiendas, c.stock_bodega, c.fecha_corte
+  FROM con_dia AS c
   JOIN ultimo_corte AS u
-    ON s.fecha_corte = u.fecha_corte
+    ON c.dia_corte = u.dia_corte
 ),
 stock_vigente AS (
   SELECT
@@ -79,17 +145,54 @@ GROUP BY sku, cod_tienda
 """
 
 
-def build_stock_query(table: str) -> str:
-    """Consulta por defecto, ya formateada para una tabla concreta."""
+def build_stock_query(table: str, columns: Iterable[str] = ()) -> str:
+    """Consulta por defecto, ya formateada para una tabla concreta.
+
+    `columns` son los nombres de columna de la tabla. Con ellos se detectan
+    las de reserva y se descuentan dentro de la consulta, para que
+    `stock_tiendas` y `stock_bodega` lleguen ya netos. Sin `columns` la
+    consulta es la de siempre y no resta nada.
+    """
+    de_tiendas, de_bodega = classify_reserve_columns(columns)
     return STOCK_QUERY.format(
         table=table,
         sku_limpio=SKU_LIMPIO_SQL.format(column="s.id_producto"),
         sku_canonico=SKU_CANONICO_SQL.format(column="sku_limpio"),
+        neto_tiendas=_net_sql("s.stock_tiendas", (f"s.{c}" for c in de_tiendas)),
+        neto_bodega=_net_sql("s.stock_bodega", (f"s.{c}" for c in de_bodega)),
+        dia_corte=DIA_CORTE_SQL.format(column="s.fecha_corte"),
     )
 
 
 # BigQuery limita el tamano de los parametros; los SKU se mandan por lotes.
 SKU_BATCH_SIZE = 5000
+
+# Anchos habituales de un codigo de producto guardado como texto con ceros a
+# la izquierda. Se usan solo para armar variantes de busqueda, nunca para
+# escribir un SKU.
+SKU_PADDED_WIDTHS = (8, 10, 12, 13)
+
+
+def sku_variants(sku: str) -> list[str]:
+    """Formas crudas en que un mismo SKU puede estar guardado en la tabla.
+
+    La consulta propia del repo canoniza los dos lados y no necesita esto.
+    Pero un `stock_query` de los secrets se ejecuta **tal cual**: si compara
+    `CAST(id_producto AS STRING)` en crudo contra el SKU ya normalizado del
+    Excel, no devuelve ninguna fila y la app informa "sin stock" con la tabla
+    llena. Mandar tambien las variantes hace que ese cruce funcione sin tener
+    que reescribir la consulta del usuario.
+    """
+    canonico = normalize_sku(sku)
+    if not canonico:
+        return []
+    variantes = [canonico]
+    if canonico.isdigit():
+        variantes.append(f"{canonico}.0")
+        variantes.extend(
+            canonico.rjust(ancho, "0") for ancho in SKU_PADDED_WIDTHS if len(canonico) < ancho
+        )
+    return list(dict.fromkeys(variantes))
 
 
 class StockSource(Protocol):
@@ -128,6 +231,34 @@ def _rename_query_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=mapping) if mapping else df
 
 
+def _parse_cutoffs(values: pd.Series) -> pd.Series:
+    """Parsea `fecha_corte` a datetime sin lanzar nunca.
+
+    `pd.to_datetime(..., format="mixed")` **si lanza** con `errors="coerce"`
+    cuando los textos traen offsets UTC distintos ("Mixed timezones detected"),
+    y eso tumbaba la consulta de stock entera. Por eso se reintenta con
+    `utc=True` y, si tampoco, se devuelve todo NaT para que el llamador caiga
+    a la comparacion textual.
+    """
+    textos = values.map(as_text)
+    for utc in (False, True):
+        try:
+            return pd.to_datetime(
+                textos, errors="coerce", dayfirst=True, format="mixed", utc=utc
+            )
+        except (ValueError, TypeError):
+            continue
+    return pd.Series(pd.NaT, index=values.index)
+
+
+def cutoff_days(values: pd.Series) -> pd.Series:
+    """Dia del corte de cada fila (medianoche), o NaT si no se pudo leer."""
+    fechas = _parse_cutoffs(values)
+    if fechas.isna().all():
+        return fechas
+    return fechas.dt.normalize()
+
+
 def latest_cutoff_value(values: pd.Series) -> Any:
     """Ultima fecha de corte, comparando como fecha y no como texto.
 
@@ -140,7 +271,7 @@ def latest_cutoff_value(values: pd.Series) -> Any:
     textos = textos[textos != ""]
     if textos.empty:
         return None
-    fechas = pd.to_datetime(textos, errors="coerce", dayfirst=True, format="mixed")
+    fechas = _parse_cutoffs(textos)
     if fechas.notna().any():
         return textos[fechas == fechas.max()].iloc[0]
     return textos.max()
@@ -152,15 +283,42 @@ def keep_latest_cutoff(df: pd.DataFrame) -> tuple[pd.DataFrame, int, str]:
     El stock es una foto, no un acumulado: si el origen trae historico, sumar
     todos los cortes multiplica las unidades disponibles e inventa stock que
     no existe.
+
+    El corte se decide **por dia, no por instante**. Si `fecha_corte` es una
+    marca de tiempo y el origen sella cada lote con su propia hora, quedarse
+    solo con el instante maximo borra casi toda la foto: la app se queda sin
+    stock aunque BigQuery lo tenga. Elegir entre varias fotos del mismo dia es
+    trabajo de `consolidate`, que lo hace por (SKU, tienda) y por eso no
+    descarta las filas de las demas tiendas.
     """
     if df.empty or "fecha_corte" not in df.columns:
         return df, 0, ""
-    corte = latest_cutoff_value(df["fecha_corte"])
-    if corte is None:
+    textos = df["fecha_corte"].map(as_text)
+    if not bool((textos != "").any()):
         return df, 0, ""
-    vigentes = df["fecha_corte"].map(as_text) == as_text(corte)
+
+    dias = cutoff_days(df["fecha_corte"])
+    vigentes = (dias == dias.max()) if dias.notna().any() else (textos == textos.max())
+
     descartadas = int((~vigentes).sum())
-    return df[vigentes].reset_index(drop=True), descartadas, as_text(corte)
+    vigente_df = df[vigentes].reset_index(drop=True)
+    corte = latest_cutoff_value(vigente_df["fecha_corte"]) if not vigente_df.empty else None
+    return vigente_df, descartadas, as_text(corte)
+
+
+# Formas validas de combinar los dos almacenes de una bodega central. Cual
+# corresponde depende de como modela el origen: no hay una universalmente
+# correcta, por eso se elige en la hoja Parametros y no en el codigo.
+CENTRAL_FORMULAS = ("sumar", "solo_bodega", "restar_tiendas")
+
+
+DEFAULT_CENTRAL_FORMULA = "solo_bodega"
+
+
+def central_formula(value: Any = None) -> str:
+    """Normaliza el nombre de la formula; lo desconocido cae en el default."""
+    texto = as_text(value).strip().lower().replace(" ", "_").replace("-", "_")
+    return texto if texto in CENTRAL_FORMULAS else DEFAULT_CENTRAL_FORMULA
 
 
 def central_warehouse_codes(codes: Iterable[str] | None = None) -> set[str]:
@@ -174,18 +332,41 @@ def central_warehouse_codes(codes: Iterable[str] | None = None) -> set[str]:
 
 
 def consolidate(df: pd.DataFrame) -> pd.DataFrame:
-    """Suma las filas repetidas de un mismo par (SKU, tienda).
+    """Una sola fila por par (SKU, tienda), dentro del corte vigente.
 
-    Una consulta propia puede devolver el stock abierto por talla, almacen o
-    linea. Sin consolidar, `build_stock_index` se queda con la ultima fila de
-    cada par y **pierde** el resto de las unidades. Se hace despues de filtrar
-    por fecha de corte: sumar entre cortes distintos inventaria stock.
+    Dentro del dia del corte pueden convivir dos cosas distintas, y hay que
+    tratarlas al reves una de la otra:
+
+    * el mismo par con la **misma** marca de tiempo repetido: es un solo corte
+      abierto por talla, almacen o linea, y ahi se **suma** — sin esto
+      `build_stock_index` se quedaba con la ultima fila y perdia unidades
+      reales;
+    * el mismo par con **varias** marcas de tiempo: son dos fotos del mismo
+      dia, y la nueva **reemplaza** a la vieja — sumarlas inventaria stock.
+
+    Distinguirlo por (SKU, tienda) —y no para toda la tabla— es lo que evita
+    que una tienda sellada una hora antes desaparezca del stock disponible.
+    Deja en `attrs["filas_reemplazadas_en_el_dia"]` cuantas filas quedaron
+    fuera por ser una foto vieja del mismo dia.
     """
     if df.empty:
         return df
     atributos = dict(df.attrs)
+
+    trabajo = df
+    reemplazadas = 0
+    fechas = _parse_cutoffs(df["fecha_corte"])
+    if fechas.notna().any():
+        trabajo = df.copy()
+        trabajo["_ts"] = fechas
+        maximos = trabajo.groupby(["sku", "cod_tienda"])["_ts"].transform("max")
+        # Un par entero sin fecha legible se conserva completo.
+        vigentes = trabajo["_ts"].eq(maximos) | (trabajo["_ts"].isna() & maximos.isna())
+        reemplazadas = int((~vigentes).sum())
+        trabajo = trabajo[vigentes].drop(columns="_ts")
+
     consolidado = (
-        df.groupby(["sku", "cod_tienda"], as_index=False, sort=False)
+        trabajo.groupby(["sku", "cod_tienda"], as_index=False, sort=False)
         .agg(
             stock_tiendas=("stock_tiendas", "sum"),
             stock_bodega=("stock_bodega", "sum"),
@@ -194,6 +375,7 @@ def consolidate(df: pd.DataFrame) -> pd.DataFrame:
         )[STOCK_COLUMNS]
     )
     consolidado.attrs.update(atributos)
+    consolidado.attrs["filas_reemplazadas_en_el_dia"] = reemplazadas
     return consolidado
 
 
@@ -201,10 +383,16 @@ def _finalize(
     df: pd.DataFrame,
     include_central_warehouse: bool,
     central_codes: Iterable[str] | None = None,
+    formula: Any = None,
 ) -> pd.DataFrame:
     """Normaliza tipos y calcula la columna `stock` efectiva."""
+    # Se guarda cuantas filas entraron: en pantalla, "cero unidades" se ve
+    # igual si la fuente no devolvio nada o si el saneamiento se lo llevo todo.
+    filas_crudas = int(len(df))
     if df.empty:
-        return empty_stock_frame()
+        vacio = empty_stock_frame()
+        vacio.attrs["filas_crudas"] = filas_crudas
+        return vacio
 
     df = _rename_query_columns(df.copy())
     missing = [name for name in ("sku", "cod_tienda") if name not in df.columns]
@@ -215,22 +403,49 @@ def _finalize(
         )
     df["sku"] = df["sku"].map(normalize_sku)
     df["cod_tienda"] = df["cod_tienda"].map(normalize_store_code)
+
+    # Reservas que llegaron como columnas propias (archivo de stock, o una
+    # consulta que las devuelve sin descontar). La consulta del repo ya las
+    # resta dentro de BigQuery, asi que ahi no queda ninguna por descontar y
+    # esto no hace nada.
+    reservas_tiendas, reservas_bodega = classify_reserve_columns(df.columns)
+
     for column in ("stock_tiendas", "stock_bodega"):
         if column not in df.columns:
             df[column] = 0
         df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int)
+
+    for column, reservas in (
+        ("stock_tiendas", reservas_tiendas),
+        ("stock_bodega", reservas_bodega),
+    ):
+        for reserva in reservas:
+            df[column] = df[column] - pd.to_numeric(
+                df[reserva], errors="coerce"
+            ).fillna(0).astype(int)
     if "fecha_corte" not in df.columns:
         df["fecha_corte"] = ""
     df["fecha_corte"] = df["fecha_corte"].map(as_text)
 
-    # El stock de bodega solo suma en las bodegas centrales (por defecto, la
-    # 320). En una tienda fisica el `stock_bodega` corresponde a otro almacen y
-    # no es despachable desde ahi, asi que se ignora.
+    # En una tienda fisica el `stock_bodega` corresponde a otro almacen y no es
+    # despachable desde ahi, asi que ahi siempre manda `stock_tiendas` solo.
+    #
+    # En una bodega central no hay una unica respuesta correcta: depende de si
+    # el origen guarda los dos almacenes por separado (hay que sumar), si
+    # `stock_bodega` ya incluye el piso (hay que tomar solo bodega) o si lo de
+    # piso ya salio del total (hay que restar). Por eso la formula se elige en
+    # la hoja Parametros; el default `sumar` es el comportamiento de siempre.
     central = df["cod_tienda"].isin(central_warehouse_codes(central_codes))
+    df["stock"] = df["stock_tiendas"]
     if include_central_warehouse:
-        df["stock"] = df["stock_tiendas"] + df["stock_bodega"].where(central, 0)
-    else:
-        df["stock"] = df["stock_tiendas"]
+        modo = central_formula(formula)
+        if modo == "solo_bodega":
+            en_central = df["stock_bodega"]
+        elif modo == "restar_tiendas":
+            en_central = df["stock_bodega"] - df["stock_tiendas"]
+        else:
+            en_central = df["stock_tiendas"] + df["stock_bodega"]
+        df["stock"] = en_central.where(central, df["stock_tiendas"])
     df["stock"] = df["stock"].astype(int)
 
     df = df[df["sku"] != ""]
@@ -250,7 +465,11 @@ def _finalize(
     # otra tiene 2 unidades, no 5. Recortar antes de sumar inflaria el stock.
     if not df.empty:
         df["stock"] = df["stock"].clip(lower=0).astype(int)
-    df.attrs["filas_descartadas_por_fecha"] = descartadas
+    reemplazadas = int(df.attrs.get("filas_reemplazadas_en_el_dia", 0))
+    df.attrs["filas_crudas"] = filas_crudas
+    df.attrs["filas_descartadas_por_fecha"] = descartadas + reemplazadas
+    df.attrs["filas_de_cortes_anteriores"] = descartadas
+    df.attrs["filas_reemplazadas_en_el_dia"] = reemplazadas
     df.attrs["fecha_corte"] = corte
     return df
 
@@ -266,6 +485,7 @@ class BigQueryStockSource:
     service_account_info: dict[str, Any] | None = None
     include_central_warehouse: bool = True
     central_codes: tuple[str, ...] = ()
+    central_formula: str = DEFAULT_CENTRAL_FORMULA
     custom_query: str = ""
     name: str = "BigQuery"
 
@@ -299,6 +519,19 @@ class BigQueryStockSource:
         except Exception as exc:
             return False, str(exc)
 
+    def table_columns(self) -> list[str]:
+        """Nombres de columna de la tabla de stock. Vacio si no se pueden leer.
+
+        Es una llamada de metadatos, no trae filas. Sirve para descubrir las
+        columnas de reserva sin que nadie tenga que declararlas a mano; si
+        falla (permisos, tabla ausente), la consulta sigue sin restar nada en
+        vez de romperse.
+        """
+        try:
+            return [campo.name for campo in self._client().get_table(self.table).schema]
+        except Exception:
+            return []
+
     def fetch(self, skus: Iterable[str]) -> pd.DataFrame:
         from google.cloud import bigquery
 
@@ -312,14 +545,23 @@ class BigQueryStockSource:
             if "{table}" in query:
                 query = query.format(table=self.table)
         else:
-            query = build_stock_query(self.table)
+            query = build_stock_query(self.table, self.table_columns())
 
         # Una consulta propia puede no filtrar por SKU (por ejemplo, la de
         # Catalogo Control Center, que trae el corte completo). En ese caso se
         # ejecuta una sola vez, sin parametros, y se filtra despues en memoria.
         filters_by_sku = "@skus" in query
+
+        # La consulta del repo canoniza el SKU dentro de BigQuery, asi que le
+        # basta el valor canonico. Una consulta propia se ejecuta tal cual y
+        # puede estar comparando el valor crudo: ahi se mandan las variantes.
+        if filters_by_sku and self.custom_query.strip():
+            a_buscar = list(dict.fromkeys(v for sku in unique for v in sku_variants(sku)))
+        else:
+            a_buscar = unique
+
         batches = (
-            [unique[start : start + SKU_BATCH_SIZE] for start in range(0, len(unique), SKU_BATCH_SIZE)]
+            [a_buscar[start : start + SKU_BATCH_SIZE] for start in range(0, len(a_buscar), SKU_BATCH_SIZE)]
             if filters_by_sku
             else [None]
         )
@@ -336,10 +578,62 @@ class BigQueryStockSource:
             frames.append(job.result().to_dataframe())
 
         combined = pd.concat(frames, ignore_index=True) if frames else empty_stock_frame()
-        result = _finalize(combined, self.include_central_warehouse, self.central_codes or None)
+        result = _finalize(
+            combined, self.include_central_warehouse, self.central_codes or None,
+            self.central_formula,
+        )
         if not filters_by_sku and not result.empty:
             result = result[result["sku"].isin(unique)].reset_index(drop=True)
+        result.attrs["skus_solicitados"] = len(unique)
+        result.attrs["tabla"] = self.table
         return result
+
+    def diagnose(self, skus: Iterable[str]) -> dict[str, Any]:
+        """Por que la consulta no trae stock. Solo lectura, sin traer datos.
+
+        Cuando la app muestra cero unidades hay varias causas posibles que se
+        ven identicas en pantalla: la tabla vacia, un corte nuevo sin filas,
+        SKU que no existen, o SKU que solo estan en cortes viejos. Esto las
+        separa con contadores concretos, usando la **misma** canonizacion de
+        SKU que la consulta real para que el resultado sea comparable.
+        """
+        from google.cloud import bigquery
+
+        unique = sorted({normalize_sku(sku) for sku in skus if normalize_sku(sku)})
+        muestra = unique[:200]
+        limpio = SKU_LIMPIO_SQL.format(column="s.id_producto")
+        sql = f"""
+        WITH con_dia AS (
+          SELECT
+            {SKU_CANONICO_SQL.format(column=limpio)} AS sku,
+            CAST(s.id_producto AS STRING)            AS sku_crudo,
+            {DIA_CORTE_SQL.format(column='s.fecha_corte')} AS dia_corte
+          FROM `{self.table}` AS s
+        ),
+        corte AS (SELECT MAX(dia_corte) AS dia FROM con_dia)
+        SELECT
+          (SELECT COUNT(*) FROM con_dia)                            AS filas_tabla,
+          (SELECT CAST(dia AS STRING) FROM corte)                   AS ultimo_corte,
+          (SELECT COUNT(*) FROM con_dia n, corte c
+             WHERE n.dia_corte = c.dia)                             AS filas_ultimo_corte,
+          (SELECT COUNT(DISTINCT n.sku) FROM con_dia n
+             WHERE n.sku IN UNNEST(@skus))                          AS skus_en_tabla,
+          (SELECT COUNT(DISTINCT n.sku) FROM con_dia n, corte c
+             WHERE n.dia_corte = c.dia AND n.sku IN UNNEST(@skus))  AS skus_en_ultimo_corte,
+          (SELECT COUNT(DISTINCT n.sku_crudo) FROM con_dia n
+             WHERE n.sku_crudo IN UNNEST(@skus))                    AS skus_sin_normalizar
+        """
+        job_config = bigquery.QueryJobConfig(
+            use_legacy_sql=False,
+            query_parameters=[bigquery.ArrayQueryParameter("skus", "STRING", muestra)],
+        )
+        client = self._client()
+        job = client.query(sql, job_config=job_config, location=self.location or None)
+        fila = dict(next(iter(job.result())).items())
+        fila["skus_consultados"] = len(muestra)
+        fila["tabla"] = self.table
+        fila["consulta_propia"] = bool(self.custom_query)
+        return fila
 
 
 @dataclass
@@ -349,6 +643,7 @@ class ManualStockSource:
     frame: pd.DataFrame
     include_central_warehouse: bool = True
     central_codes: tuple[str, ...] = ()
+    central_formula: str = DEFAULT_CENTRAL_FORMULA
     name: str = "Archivo de stock"
 
     COLUMN_ALIASES = {
@@ -405,6 +700,13 @@ class ManualStockSource:
             }
         )
 
+        # Las columnas de reserva viajan tal cual para que `_finalize` las
+        # descuente. Sin esto quedaban fuera del DataFrame que se le pasa y el
+        # disponible salia sin restar lo reservado.
+        for columna in self.frame.columns:
+            if RESERVE_HINT in as_text(columna).strip().lower():
+                data[columna] = self.frame[columna]
+
         wanted = {normalize_sku(sku) for sku in skus if normalize_sku(sku)}
         data["sku"] = data["sku"].map(normalize_sku)
         if wanted:
@@ -412,7 +714,10 @@ class ManualStockSource:
 
         # `_finalize` deja solo el ultimo corte y recien ahi suma las filas
         # repetidas del mismo par (SKU, tienda).
-        return _finalize(data, self.include_central_warehouse, self.central_codes or None)
+        return _finalize(
+            data, self.include_central_warehouse, self.central_codes or None,
+            self.central_formula,
+        )
 
 
 def build_stock_index(stock: pd.DataFrame) -> dict[tuple[str, str], int]:
@@ -491,6 +796,7 @@ def secrets_to_source(
     secrets: dict[str, Any],
     include_central_warehouse: bool,
     central_codes: Iterable[str] | None = None,
+    formula: Any = None,
 ) -> BigQueryStockSource:
     """Construye el proveedor de BigQuery desde `st.secrets`.
 
@@ -511,6 +817,7 @@ def secrets_to_source(
         service_account_info=service_account_info,
         include_central_warehouse=include_central_warehouse,
         central_codes=tuple(sorted(central_warehouse_codes(central_codes))),
+        central_formula=central_formula(formula),
         custom_query=as_text(config.get("stock_query")),
     )
 

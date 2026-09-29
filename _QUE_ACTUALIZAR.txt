@@ -1,12 +1,28 @@
 Archivos a actualizar en HugoCamara7/reassign-control-center (rama main)
 
-NUEVO       scripts/test_stock_cutoff.py
-MODIFICADO  .gitignore
-MODIFICADO  README.md
-MODIFICADO  app.py
-MODIFICADO  core/stock_source.py
+Ya no hace falta subirlos a mano: van por PR #1, que ahora incluye el merge
+de main (el arreglo del cruce de SKU del PR #2). Esta lista queda solo como
+resumen de lo que toca ese PR.
 
---- BORRAR del repo (ya no existen en el proyecto) ---
+Arreglo del corte de stock: la app devolvia cero unidades porque el corte se
+elegia por INSTANTE y no por dia, asi que cada tienda sellada un minuto antes
+desaparecia de la foto. El arreglo del SKU (PR #2) ya esta integrado.
+
+MODIFICADO  core/stock_source.py     corte por dia, offsets UTC, cast de unidades, diagnose()
+MODIFICADO  app.py                   panel "Diagnosticar fuente de stock"
+MODIFICADO  scripts/test_stock_cutoff.py   15 casos (5 nuevos de regresion)
+MODIFICADO  README.md                seccion "Cuando la app no trae stock"
+
+Para comprobar que quedo bien:
+
+    python -m scripts.test_stock_cutoff     15/15
+    python -m scripts.test_stock_match      16/16
+    python -m scripts.test_rules            29/29
+    python -m scripts.test_stock_ledger     11/11
+    python -m scripts.test_secrets_compat   11/11
+    python -m scripts.test_app_flow         15/15
+
+--- BORRAR del repo (sigue pendiente, no cambio) ---
 BORRAR      .streamlit/config
 BORRAR      _QUE_ACTUALIZAR.txt
 BORRAR      assets/aas
@@ -16,5 +32,3 @@ BORRAR      config/prioridad_tiendas.ejemplo.xlsx
 BORRAR      core/core
 BORRAR      docs/eee
 BORRAR      download
-
-Descomprimir sobre la raiz del repo, respetando las carpetas.

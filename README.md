@@ -29,8 +29,16 @@ Subir archivo -> Validar -> Consultar BigQuery -> Reasignar -> Revisar -> Descar
    unos ceros a la izquierda no dejan al pedido sin stock.
    **Solo entra el ultimo corte**: el stock es una foto, no un acumulado. Si la
    fuente trae historico, los cortes anteriores se descartan y la app informa
-   cuantas filas dejo fuera. Las filas repetidas de un mismo par (SKU, tienda)
-   dentro del corte se suman, nunca se pisan.
+   cuantas filas dejo fuera.
+   **El disponible es neto**: a cada almacen se le descuentan sus columnas de
+   reserva, reconocidas por el encabezado (cualquiera que diga `reserva`). En
+   una bodega central cuenta su `stock_bodega`; en una tienda fisica, su
+   `stock_tiendas`. Nunca se suman los dos: es la misma mercaderia contada dos
+   veces. El corte se decide **por dia**: si el origen sella
+   cada lote con su propia hora, todas las horas de ese dia siguen siendo la
+   misma foto. Las filas repetidas de un mismo par (SKU, tienda) con la misma
+   marca de tiempo se suman, nunca se pisan; si el par trae **dos** marcas de
+   tiempo del mismo dia, gana la mas nueva (son dos fotos, no dos almacenes).
    La app muestra, SKU por SKU, si la fuente no lo devolvio (`SIN RESPUESTA`),
    si lo devolvio en cero (`EN CERO`) o con unidades (`CON STOCK`); el detalle
    tambien viaja en el reporte operativo.
@@ -44,6 +52,12 @@ Subir archivo -> Validar -> Consultar BigQuery -> Reasignar -> Revisar -> Descar
    veces el mismo par (SKU, tienda).
 7. Nunca reasigna a la tienda de origen del propio pedido.
 8. Marca `SIN OPCION DE REASIGNACION` cuando ninguna tienda alcanza.
+8b. Informa una **2da opcion**: la siguiente tienda de la prioridad que tambien
+   podria cubrir el pedido entero. Sirve para cuando la tienda elegida ya
+   rechazo el pedido y hay que reasignarlo a mano sin volver a correr la app.
+   **No se le reserva stock** — reservarlo dejaria unidades sin usar en cada
+   corrida —, por eso se informa cuantas unidades tenia al momento del
+   calculo: si dice 1, esa unidad la puede tomar un solo pedido.
 9. Genera el Excel final con las columnas originales intactas y la tienda escrita
    en `Nom Tda Reasignada` (la crea si el archivo no la trae).
 
@@ -153,9 +167,11 @@ python -m scripts.import_priority "ruta\Priorizacion Tiendas.xlsx"
 | `fallback_linea_si_grupo_falla` | `SI` | si nadie cubre el grupo, resolver linea por linea |
 | `incluir_stock_bodega_central` | `SI` | en las bodegas centrales suma `stock_bodega` |
 | `codigos_bodega_central` | `320` | que bodegas cuentan como centrales, separadas por coma |
+| `formula_bodega_central` | `solo_bodega` | `solo_bodega`, `sumar` o `restar_tiendas` en una bodega central |
 | `stock_seguridad_global` | `0` | unidades intocables en todas las tiendas |
 | `reserva_por_tienda` | `1` | unidades que la tienda deberia conservar tras ceder; `0` desactiva |
 | `ordenar_por_stock` | `SI` | dentro de la misma banda gana la tienda con mas stock |
+| `opciones_alternativas` | `1` | tiendas de respaldo que se informan por pedido (0 a 3) |
 | `max_unidades_por_tienda` | `0` | tope por tienda y corrida (`0` = sin tope) |
 | `columna_salida` | `Nom Tda Reasignada` | nombre exacto de la columna destino |
 
@@ -209,6 +225,38 @@ Excel no se genera y se explica el motivo.
 
 Las columnas de trazabilidad (`Reasig_*`) son **opcionales**: desactivadas, el Excel
 de carga queda con exactamente las columnas originales mas la de reasignacion.
+Entre ellas viajan `Reasig_2da_Opcion`, `Reasig_Cod_2da_Opcion` y
+`Reasig_Stock_2da_Opcion` con la tienda de respaldo; en el reporte operativo las
+mismas columnas salen como `2da opcion` y `Stock 2da opcion`.
+
+---
+
+## Cuando la app no trae stock
+
+El paso 4 ya separa, SKU por SKU, el que la fuente no conoce (`SIN RESPUESTA`)
+del que vuelve en cero (`EN CERO`). Si no vuelve **ni una fila**, el paso 3
+muestra ademas el boton **"Diagnosticar fuente de stock"**, que corre
+contadores de solo lectura sobre la tabla y separa causas que en pantalla se
+ven identicas:
+
+| Lo que informa | Que significa |
+|----------------|---------------|
+| Filas en la tabla = 0 | la tabla de stock esta vacia: es el origen, no la app |
+| Filas del ultimo corte = 0 | hay una `fecha_corte` nueva pero sin datos (carga a medio terminar) |
+| SKU hallados en la tabla = 0 | los SKU del archivo no existen en la tabla de stock |
+| SKU en el ultimo corte = 0 | existen, pero solo en cortes viejos: el stock no usa fechas pasadas |
+
+El diagnostico canoniza el SKU con la misma regla que la consulta real, para
+que sus contadores sean comparables con lo que devuelve el paso 3.
+
+Dos detalles del origen que hacian que la consulta devolviera **cero filas sin
+fallar**, y que la app ahora resuelve sola:
+
+* `fecha_corte` como marca de tiempo. `MAX(fecha_corte)` es un **instante**: si
+  el ETL sella cada lote con su hora, unir por igualdad se queda con una
+  rebanada minima de la foto. Ahora se une por dia.
+* Offsets UTC mezclados en `fecha_corte`. Al compararlos como fecha, pandas
+  lanzaba `Mixed timezones detected` y tumbaba la consulta entera.
 
 ---
 
@@ -242,7 +290,7 @@ scripts/
   build_release_zip.py          empaqueta el proyecto para GitHub
   test_rules.py                 29 pruebas de reglas de negocio
   test_stock_ledger.py          11 pruebas del descuento temporal de stock
-  test_stock_cutoff.py          10 pruebas del filtro por fecha de corte
+  test_stock_cutoff.py          15 pruebas del filtro por fecha de corte
   test_stock_match.py           16 pruebas del cruce SKU <-> stock
   test_app_flow.py              15 pruebas de la app (acceso, flujo, pasos 3-5)
   test_secrets_compat.py        11 pruebas de compatibilidad de secrets
@@ -285,9 +333,10 @@ ordenes contra 40 unidades.
 python -m scripts.test_stock_cutoff
 ```
 
-10 casos sobre el filtro de fecha: historico de dos anios, fechas `DD/MM/YYYY`
-(donde comparar como texto elige mal), fechas con hora, y consultas propias sin
-filtro de fecha.
+15 casos sobre el filtro de fecha: historico de dos anios, fechas `DD/MM/YYYY`
+(donde comparar como texto elige mal), fechas con hora, consultas propias sin
+filtro de fecha, marcas de tiempo distintas por lote dentro del mismo dia,
+offsets UTC mezclados y la canonizacion del SKU en la propia consulta.
 
 ```bash
 python -m scripts.test_stock_match

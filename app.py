@@ -29,7 +29,7 @@ from core.stock_source import (
     stock_coverage,
     stock_cutoff,
 )
-from core.excel_io import normalize_status
+from core.excel_io import as_text, normalize_status
 from core.validation import resolve_columns, validate
 from scripts.build_priority_template import build_bytes as build_priority_bytes
 from ui import components as ui
@@ -353,11 +353,25 @@ def step_stock(config, mode: str) -> None:
         "BigQuery nunca se modifica.".replace(",", " "),
     )
 
+    # Un `stock_query` en los secrets se ejecuta TAL CUAL: no pasa por la
+    # canonizacion del SKU ni por el corte por dia que trae la app. Si la
+    # consulta propia esta desactualizada, la app informa "sin stock" con la
+    # tabla llena y desde la interfaz no habia forma de saberlo.
+    if mode.startswith("BigQuery") and as_text(bigquery_secrets().get("stock_query")):
+        ui.note(
+            "warn",
+            "Los secrets traen una consulta de stock propia",
+            "La app la usa TAL CUAL, asi que no le aplica su canonizacion del SKU ni "
+            "su corte por dia. Si el stock no llega, quita `stock_query` del bloque "
+            "[bigquery] de los secrets para que la app use su propia consulta.",
+        )
+
     if st.session_state.get("stock_error"):
         ui.note("bad", "Fallo la consulta de stock", st.session_state["stock_error"])
 
     columns = st.columns([1, 1, 2])
     launch = columns[0].button("Consultar stock", type="primary", width="stretch")
+    render_stock_diagnosis(skus, mode)
 
     if not launch:
         return
@@ -365,11 +379,14 @@ def step_stock(config, mode: str) -> None:
     st.session_state.pop("stock_error", None)
     include_central = config.flag("incluir_stock_bodega_central")
     central_codes = config.param("codigos_bodega_central")
+    formula_central = config.param("formula_bodega_central")
 
     try:
         with st.spinner("Consultando stock..."):
             if mode.startswith("BigQuery"):
-                source = secrets_to_source(bigquery_secrets(), include_central, central_codes)
+                source = secrets_to_source(
+                    bigquery_secrets(), include_central, central_codes, formula_central
+                )
                 stock = source.fetch(skus)
             else:
                 cached = st.session_state.get("stock_file")
@@ -377,7 +394,7 @@ def step_stock(config, mode: str) -> None:
                     raise ValueError("Sube un archivo de stock en la barra lateral.")
                 frame = excel_io.read_stock_file(cached[0], cached[1])
                 stock = ManualStockSource(
-                    frame, include_central, tuple(central_codes.split(","))
+                    frame, include_central, tuple(central_codes.split(",")), formula_central
                 ).fetch(skus)
     except Exception as exc:
         st.session_state["stock_error"] = str(exc)
@@ -388,6 +405,89 @@ def step_stock(config, mode: str) -> None:
     st.session_state["stock_skus"] = skus
     st.session_state.pop("result", None)
     st.rerun()
+
+
+def render_stock_diagnosis(skus: list[str], mode: str) -> None:
+    """Explica por que la consulta no trajo NADA, en vez de mostrar ceros.
+
+    El paso 4 ya separa el SKU que la fuente no conoce del que vuelve en cero.
+    Esto cubre el caso anterior: cuando no vuelve ni una fila, y desde la
+    interfaz se ven igual la tabla vacia, un corte nuevo a medio cargar, SKU
+    que no existen y SKU que solo estan en cortes viejos.
+    """
+    stock = st.session_state.get("stock")
+    if stock is None or not stock.empty:
+        return
+
+    crudas = int(stock.attrs.get("filas_crudas", 0))
+    ui.note(
+        "warn",
+        "La fuente no devolvio stock para ningun SKU",
+        f"Se consultaron {len(skus):,} SKU y la consulta devolvio {crudas:,} filas. "
+        "Revisa el diagnostico para ver en que paso se pierden.".replace(",", " "),
+    )
+    if not mode.startswith("BigQuery"):
+        return
+    if not st.button("Diagnosticar fuente de stock"):
+        return
+
+    try:
+        with st.spinner("Revisando la tabla de stock..."):
+            datos = secrets_to_source(bigquery_secrets(), True).diagnose(skus)
+    except Exception as exc:
+        ui.note("bad", "No se pudo diagnosticar", str(exc))
+        return
+
+    ui.kpi_grid(
+        [
+            ("Filas en la tabla", datos.get("filas_tabla", 0), "neutral", datos.get("tabla", "")),
+            ("Ultimo corte", datos.get("ultimo_corte") or "-", "neutral", "MAX(fecha_corte)"),
+            ("Filas del ultimo corte", datos.get("filas_ultimo_corte", 0),
+             "ok" if datos.get("filas_ultimo_corte") else "bad", "Si es 0, el corte esta vacio"),
+            ("SKU hallados en la tabla", datos.get("skus_en_tabla", 0),
+             "ok" if datos.get("skus_en_tabla") else "bad",
+             f"de {datos.get('skus_consultados', 0)} consultados"),
+            ("SKU en el ultimo corte", datos.get("skus_en_ultimo_corte", 0),
+             "ok" if datos.get("skus_en_ultimo_corte") else "warn", "Los que si tendrian stock"),
+        ]
+    )
+
+    if not datos.get("filas_tabla"):
+        ui.note("bad", "La tabla de stock esta vacia",
+                f"{datos.get('tabla', '')} no tiene filas. Es un problema del origen, no de la app.")
+    elif not datos.get("filas_ultimo_corte"):
+        ui.note("bad", "El ultimo corte no tiene filas",
+                "La fecha de corte mas reciente existe pero llego sin datos: probablemente "
+                "una carga a medio terminar en el datalake.")
+    elif not datos.get("skus_en_tabla"):
+        ui.note(
+            "bad",
+            "Ningun SKU del archivo existe en la tabla de stock",
+            "Los dos lados se comparan ya canonizados (sin '.0', sin ceros a la izquierda). "
+            "Si aun asi no cruzan, la tabla usa otro maestro de codigos.",
+        )
+    elif not datos.get("skus_en_ultimo_corte"):
+        ui.note(
+            "warn",
+            "Los SKU existen, pero no en el ultimo corte",
+            f"Estan en cortes anteriores. El corte vigente ({datos.get('ultimo_corte')}) "
+            "no los incluye, y el stock es una foto: no se usan fechas viejas.",
+        )
+    else:
+        ui.note(
+            "info",
+            "La tabla si tiene stock para estos SKU",
+            "Vuelve a consultar. Si sigue en cero, el filtro por bodega o por unidades "
+            "es lo que los deja fuera (todas las filas con 0 unidades).",
+        )
+
+    if datos.get("skus_sin_normalizar") and not datos.get("skus_en_tabla"):
+        ui.note(
+            "info",
+            "Coinciden sin canonizar",
+            "El SKU coincide contra el valor crudo pero no contra el canonizado: "
+            "avisa al equipo, es un caso que la app deberia cubrir.",
+        )
 
 
 def step_reassign(config, mode: str = "") -> None:
@@ -425,13 +525,21 @@ def step_reassign(config, mode: str = "") -> None:
 
     # El stock es una foto: si la fuente trajo historico, se aviso cuantas
     # filas de cortes anteriores se dejaron fuera. Sumarlas inventaria stock.
-    descartadas = int(stock.attrs.get("filas_descartadas_por_fecha", 0))
-    if descartadas:
+    anteriores = int(stock.attrs.get("filas_de_cortes_anteriores", 0))
+    reemplazadas = int(stock.attrs.get("filas_reemplazadas_en_el_dia", 0))
+    if anteriores or reemplazadas:
+        detalle = []
+        if anteriores:
+            detalle.append(f"{anteriores:,} de fechas anteriores".replace(",", " "))
+        if reemplazadas:
+            detalle.append(
+                f"{reemplazadas:,} reemplazadas por una foto mas nueva del mismo dia".replace(",", " ")
+            )
         ui.note(
             "info",
-            f"Se ignoraron {descartadas:,} filas de cortes anteriores".replace(",", " "),
-            f"La fuente trajo historico. Solo se usa la foto del {cutoff}, porque el stock "
-            "no se acumula entre fechas.",
+            f"Se ignoraron {anteriores + reemplazadas:,} filas de cortes anteriores".replace(",", " "),
+            f"La fuente trajo historico ({' y '.join(detalle)}). Solo se usa la foto del "
+            f"{cutoff}, porque el stock no se acumula entre fechas.",
         )
 
     # --- por que un SKU no trae stock --------------------------------------

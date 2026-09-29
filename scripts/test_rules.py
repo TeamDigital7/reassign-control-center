@@ -401,6 +401,133 @@ def test_missing_sku():
     assert result.kpis.errores == 1
 
 
+@case("Sin opcion: se informa el mejor stock hallado, no un 0 enganoso")
+def test_sin_opcion_informa_disponible():
+    # Con 0 en las dos situaciones, desde la app se veian identicas: "no hay
+    # stock en ningun lado" y "hay, pero repartido y no alcanza".
+    config = make_config()
+    orders = make_orders([order("P1", "A", 5)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    result = run(orders, {("A", "10"): 2, ("A", "20"): 3}, config)
+    fila = result.detail.iloc[0]
+    assert fila["Resultado"] == settings.RESULT_NO_OPTION
+    assert int(fila["Stock disponible"]) == 3, fila.to_dict()
+    assert "la mejor es TIENDA B con 3" in fila["Detalle"], fila["Detalle"]
+    # La columna de trazabilidad del Excel lleva el mismo dato.
+    assert int(result.output_df.iloc[0]["Reasig_Stock_Disponible"]) == 3
+
+
+@case("Sin opcion: sin stock en ninguna tienda el 0 es real y se dice cuantas se miraron")
+def test_sin_opcion_sin_stock_real():
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    fila = run(orders, {}, config).detail.iloc[0]
+    assert int(fila["Stock disponible"]) == 0
+    assert "Ninguna de las 3 tiendas" in fila["Detalle"], fila["Detalle"]
+
+
+@case("2da opcion: el caso del correo, la 1a tienda tiene una sola unidad")
+def test_segunda_opcion_una_unidad():
+    # Si la tienda elegida rechaza el pedido, quien lo gestiona necesita a
+    # donde mandarlo sin volver a correr la app.
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    fila = run(orders, {("A", "10"): 1, ("A", "20"): 4, ("A", "30"): 2}, config).detail.iloc[0]
+    # Dentro de la misma banda gana la mas surtida, y la siguiente es el plan B.
+    assert fila["Tienda reasignada"] == "TIENDA B" and fila["Stock disponible"] == 4
+    assert fila["2da opcion"] == "TIENDA A", fila.to_dict()
+    assert int(fila["Stock 2da opcion"]) == 1
+
+
+@case("2da opcion: solo entra una tienda que cubra el pedido entero")
+def test_segunda_opcion_debe_cubrir_todo():
+    # Una tienda con la mitad no sirve de plan B: el pedido igual se cae.
+    config = make_config()
+    orders = make_orders([order("P1", "A", 3)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    fila = run(orders, {("A", "10"): 5, ("A", "20"): 1}, config).detail.iloc[0]
+    assert fila["Tienda reasignada"] == "TIENDA A"
+    assert fila["2da opcion"] == "", fila.to_dict()
+
+
+@case("2da opcion: no consume stock ni se la reserva")
+def test_segunda_opcion_no_consume():
+    # Reservarle unidades dejaria stock sin usar en cada corrida.
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    result = run(orders, {("A", "10"): 5, ("A", "20"): 4}, config)
+    usadas = result.store_summary.to_dict("records")
+    assert usadas == [{"cod_tienda": "10", "nom_tienda": "TIENDA A", "unidades_reasignadas": 1}], usadas
+
+
+@case("2da opcion: refleja lo ya comprometido por los pedidos anteriores")
+def test_segunda_opcion_respeta_el_descuento():
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1), order("P2", "A", 1), order("P3", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    detalle = run(orders, {("A", "10"): 2, ("A", "20"): 1}, config).detail
+    # Las dos primeras van a A (2 unidades) con B de respaldo; la tercera se
+    # lleva la unica unidad de B y ya no tiene respaldo que ofrecer.
+    assert list(detalle["Tienda reasignada"]) == ["TIENDA A", "TIENDA A", "TIENDA B"]
+    assert list(detalle["2da opcion"]) == ["TIENDA B", "TIENDA B", ""], detalle.to_dict("records")
+
+
+@case("2da opcion: nunca es la tienda de origen del propio pedido")
+def test_segunda_opcion_excluye_origen():
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1, "TIENDA A", "10")])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    fila = run(orders, {("A", "10"): 5, ("A", "20"): 4}, config).detail.iloc[0]
+    assert fila["Tienda reasignada"] == "TIENDA B"
+    assert fila["2da opcion"] == "", fila.to_dict()
+
+
+@case("2da opcion: una fila SIN OPCION no ofrece respaldo")
+def test_segunda_opcion_sin_opcion():
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    fila = run(orders, {}, config).detail.iloc[0]
+    assert fila["Resultado"] == settings.RESULT_NO_OPTION
+    assert fila["2da opcion"] == ""
+
+
+@case("2da opcion: cuantas se informan se configura en Parametros")
+def test_segunda_opcion_configurable():
+    orders = make_orders([order("P1", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+    stock = {("A", "10"): 5, ("A", "20"): 4, ("A", "30"): 2}
+
+    dos = run(orders, stock, make_config(opciones_alternativas="2")).detail.iloc[0]
+    assert dos["2da opcion"] == "TIENDA B" and dos["3ra opcion"] == "TIENDA C", dos.to_dict()
+
+    cero = run(orders, stock, make_config(opciones_alternativas="0")).detail
+    assert [c for c in cero.columns if "opcion" in c.lower()] == []
+
+
+@case("2da opcion: viaja al Excel y se va con el resto de la trazabilidad")
+def test_segunda_opcion_en_el_excel():
+    config = make_config()
+    orders = make_orders([order("P1", "A", 1)])
+    orders[settings.COL_STATUS] = "SIN_STOCK"
+
+    con = run(orders, {("A", "10"): 5, ("A", "20"): 4}, config)
+    assert "Reasig_2da_Opcion" in con.output_headers
+    assert con.output_df.iloc[0]["Reasig_2da_Opcion"] == "TIENDA B"
+    assert con.output_df.iloc[0]["Reasig_Cod_2da_Opcion"] == "20"
+    assert int(con.output_df.iloc[0]["Reasig_Stock_2da_Opcion"]) == 4
+
+    # Sin trazabilidad el Excel de carga queda con las columnas originales.
+    sin = engine.reassign(
+        df=orders, headers=HEADERS, resolved=resolve_columns(HEADERS), config=config,
+        stock_index={("A", "10"): 5, ("A", "20"): 4}, stock_cutoff="", include_trace=False,
+    )
+    assert [c for c in sin.output_headers if "Opcion" in c] == [], sin.output_headers
+
+
 def main() -> int:
     passed, failed = 0, []
     for name, test in CASES:

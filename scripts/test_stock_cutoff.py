@@ -19,6 +19,7 @@ import pandas as pd
 from core.stock_source import (
     ManualStockSource,
     _finalize,
+    build_stock_query,
     keep_latest_cutoff,
     latest_cutoff_value,
 )
@@ -164,6 +165,89 @@ def test_valor_corte():
     serie = pd.Series(["", "2026-08-20", None, "2025-01-01"])
     assert latest_cutoff_value(serie) == "2026-08-20"
     assert latest_cutoff_value(pd.Series(["", None])) is None
+
+
+@case("Marcas de tiempo por lote: no se pierde ninguna tienda del mismo dia")
+def test_lotes_con_hora_distinta():
+    # El ETL sella cada lote con su propia hora. Quedarse solo con el instante
+    # maximo borraba casi toda la foto y la app aparecia sin stock.
+    crudo = pd.DataFrame(
+        [
+            {"sku": "5438957", "cod_tienda": "151", "stock_tiendas": 3,
+             "stock_bodega": 0, "fecha_corte": "2026-08-28 01:00:00+00:00"},
+            {"sku": "5438957", "cod_tienda": "320", "stock_tiendas": 0,
+             "stock_bodega": 40, "fecha_corte": "2026-08-28 02:00:00+00:00"},
+            {"sku": "9999", "cod_tienda": "151", "stock_tiendas": 5,
+             "stock_bodega": 0, "fecha_corte": "2026-08-28 01:00:00+00:00"},
+        ]
+    )
+    out = _finalize(crudo, include_central_warehouse=True)
+    assert len(out) == 3, out.to_dict("records")
+    assert int(out["stock"].sum()) == 48, out.to_dict("records")
+    assert out.attrs["filas_descartadas_por_fecha"] == 0
+
+
+@case("Offsets UTC mezclados: no tumban la consulta de stock")
+def test_offsets_mezclados():
+    # `to_datetime(format="mixed")` lanza con offsets distintos aunque se pida
+    # errors="coerce": eso hacia fallar la consulta entera.
+    crudo = pd.DataFrame(
+        [
+            {"sku": "A", "cod_tienda": "10", "stock_tiendas": 4,
+             "stock_bodega": 0, "fecha_corte": "2026-08-28 00:00:00-05:00"},
+            {"sku": "B", "cod_tienda": "20", "stock_tiendas": 6,
+             "stock_bodega": 0, "fecha_corte": "2026-08-28 00:00:00+00:00"},
+        ]
+    )
+    out = _finalize(crudo, include_central_warehouse=True)
+    assert len(out) == 2, out.to_dict("records")
+    assert int(out["stock"].sum()) == 10, out.to_dict("records")
+
+
+@case("La foto mas nueva del dia reemplaza solo a su propio SKU/tienda")
+def test_reemplazo_por_combinacion():
+    datos = archivo(
+        [
+            {"sku": "A", "cod_tienda": "10", "stock": 8, "fecha_corte": "2026-08-28 06:00:00"},
+            {"sku": "A", "cod_tienda": "10", "stock": 2, "fecha_corte": "2026-08-28 18:00:00"},
+            {"sku": "B", "cod_tienda": "20", "stock": 7, "fecha_corte": "2026-08-28 06:00:00"},
+        ]
+    )
+    out = ManualStockSource(datos, True).fetch(["A", "B"])
+    por_sku = dict(zip(out["sku"], out["stock"]))
+    assert por_sku == {"A": 2, "B": 7}, out.to_dict("records")
+    assert out.attrs["filas_reemplazadas_en_el_dia"] == 1
+    assert out.attrs["filas_de_cortes_anteriores"] == 0
+
+
+@case("Se registra cuantas filas devolvio la fuente antes de sanear")
+def test_filas_crudas():
+    datos = archivo(
+        [
+            {"sku": "A", "cod_tienda": "10", "stock": 1, "fecha_corte": "2025-01-01"},
+            {"sku": "A", "cod_tienda": "10", "stock": 2, "fecha_corte": "2026-08-28"},
+        ]
+    )
+    out = ManualStockSource(datos, True).fetch(["A"])
+    assert out.attrs["filas_crudas"] == 2, out.attrs
+    # Sin coincidencias, queda claro que la fuente no devolvio nada.
+    vacio = ManualStockSource(datos, True).fetch(["ZZZ"])
+    assert vacio.empty and vacio.attrs["filas_crudas"] == 0
+
+
+@case("La consulta de BigQuery une el corte por dia y castea las unidades")
+def test_consulta_por_dia():
+    consulta = build_stock_query("proyecto.dataset.tabla")
+    # El corte se une por dia, no por instante: `MAX(fecha_corte)` de un
+    # TIMESTAMP es un instante y se llevaria casi toda la foto por delante.
+    assert "c.dia_corte = u.dia_corte" in consulta, consulta
+    assert "MAX(dia_corte)" in consulta, consulta
+    assert "AS DATE)" in consulta, consulta
+    # Un CAST directo de '3.0' a INT64 falla en BigQuery y tumba la consulta.
+    assert "SAFE_CAST(CAST(s.stock_tiendas AS STRING) AS FLOAT64)" in consulta, consulta
+    # La canonizacion del SKU (de main) sigue en pie en los dos lados.
+    assert "sku IN UNNEST(@skus)" in consulta, consulta
+    assert "REGEXP_REPLACE(UPPER(TRIM(CAST(s.id_producto AS STRING)))" in consulta, consulta
 
 
 def main() -> int:

@@ -132,9 +132,11 @@ DEFAULT_PARAMS = {
     "fallback_linea_si_grupo_falla": "SI",
     "incluir_stock_bodega_central": "SI",
     "codigos_bodega_central": ",".join(CENTRAL_WAREHOUSE_CODES),
+    "formula_bodega_central": "solo_bodega",
     "stock_seguridad_global": "0",
     "reserva_por_tienda": "1",
     "ordenar_por_stock": "SI",
+    "opciones_alternativas": "1",
     "max_unidades_por_tienda": "0",
     "columna_salida": COL_REASSIGNED,
 }
@@ -149,6 +151,14 @@ PARAM_HELP = {
         "completo, se resuelve linea por linea. NO = el grupo entero queda sin opcion."
     ),
     "incluir_stock_bodega_central": "SI = en las bodegas centrales se suma stock_bodega al disponible.",
+    "formula_bodega_central": (
+        "Como se combinan stock_tiendas y stock_bodega EN UNA BODEGA CENTRAL. "
+        "solo_bodega = stock_bodega (por defecto: en una bodega central el "
+        "disponible es su propio stock). sumar = stock_tiendas + stock_bodega. "
+        "restar_tiendas = stock_bodega - stock_tiendas. En una tienda fisica no "
+        "aplica en ningun caso: ahi solo cuenta stock_tiendas. En los tres casos "
+        "se descuentan antes las columnas de reserva."
+    ),
     "codigos_bodega_central": (
         "Bodegas donde stock_bodega si es despachable, separadas por coma. "
         "Por defecto solo la 320."
@@ -164,5 +174,12 @@ PARAM_HELP = {
         "NO = gana la primera de la lista."
     ),
     "max_unidades_por_tienda": "Tope de unidades reasignadas por tienda en una corrida. 0 = sin tope.",
+    "opciones_alternativas": (
+        "Cuantas tiendas de respaldo se informan por pedido, ademas de la elegida. "
+        "Sirve cuando la primera tienda rechaza el pedido y hay que reasignarlo a "
+        "mano sin volver a correr la app. Solo entran tiendas que cubren el pedido "
+        "entero. No se les reserva stock: se informa cuantas unidades tenian al "
+        "momento del calculo. 0 desactiva la columna; el maximo es 3."
+    ),
     "columna_salida": "Nombre exacto de la columna donde se escribe la tienda reasignada.",
 }
