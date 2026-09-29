@@ -267,6 +267,43 @@ def test_paso_5():
     assert "Descargar Excel de carga" in etiquetas, etiquetas
 
 
+@case("Version mezclada: no se cae con un TypeError de argumentos")
+def test_call_compat_modulo_viejo():
+    # Streamlit re-ejecuta app.py en cada interaccion pero conserva en memoria
+    # los modulos ya importados. Tras un despliegue archivo por archivo puede
+    # quedar un app.py nuevo llamando a un core/ viejo, y la corrida se caia
+    # con "secrets_to_source() takes from 2 to 3 positional arguments but 4
+    # were given", que no le dice nada a quien usa la app.
+    import app
+
+    def vieja(secrets, include_central_warehouse, central_codes=None):
+        return ("vieja", central_codes)
+
+    assert app.call_compat(vieja, {}, True, "320", "solo_bodega") == ("vieja", "320")
+
+    def nueva(secrets, include_central_warehouse, central_codes=None, formula=None):
+        return ("nueva", central_codes, formula)
+
+    assert app.call_compat(nueva, {}, True, "320", "solo_bodega") == (
+        "nueva", "320", "solo_bodega",
+    )
+
+
+@case("Version mezclada: se detecta y se avisa, no pasa en silencio")
+def test_stale_modules():
+    import app
+    from core.stock_source import secrets_to_source
+
+    # Con el codigo al dia no hay nada que avisar.
+    assert app.stale_modules() is False
+    assert app._positional_limit(secrets_to_source) >= 4
+
+    def vieja(secrets, include_central_warehouse, central_codes=None):
+        return None
+
+    assert app._positional_limit(vieja) == 3
+
+
 def main() -> int:
     passed, failed = 0, []
     for name, test in CASES:
