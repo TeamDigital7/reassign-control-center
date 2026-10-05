@@ -14,7 +14,7 @@ Ambos devuelven un DataFrame con el mismo contrato:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, ClassVar, Iterable, Protocol
 
 import pandas as pd
 
@@ -487,6 +487,9 @@ class BigQueryStockSource:
     central_codes: tuple[str, ...] = ()
     central_formula: str = DEFAULT_CENTRAL_FORMULA
     custom_query: str = ""
+    # Centinela: marca "usa la consulta del repo". Un string vacio no sirve,
+    # porque una consulta propia tambien podria llegar vacia por error.
+    _built_in_marker: ClassVar[object] = object()
     name: str = "BigQuery"
 
     def _client(self):
@@ -532,20 +535,15 @@ class BigQueryStockSource:
         except Exception:
             return []
 
-    def fetch(self, skus: Iterable[str]) -> pd.DataFrame:
+    def _run_query(self, client, query: str, unique: list[str]) -> pd.DataFrame:
+        """Ejecuta una consulta ya resuelta y devuelve el stock saneado."""
         from google.cloud import bigquery
 
-        unique = sorted({normalize_sku(sku) for sku in skus if normalize_sku(sku)})
-        if not unique:
-            return empty_stock_frame()
-
-        client = self._client()
-        query = self.custom_query.strip()
-        if query:
-            if "{table}" in query:
-                query = query.format(table=self.table)
-        else:
+        es_propia = query is not self._built_in_marker
+        if query is self._built_in_marker:
             query = build_stock_query(self.table, self.table_columns())
+        elif "{table}" in query:
+            query = query.format(table=self.table)
 
         # Una consulta propia puede no filtrar por SKU (por ejemplo, la de
         # Catalogo Control Center, que trae el corte completo). En ese caso se
@@ -555,7 +553,7 @@ class BigQueryStockSource:
         # La consulta del repo canoniza el SKU dentro de BigQuery, asi que le
         # basta el valor canonico. Una consulta propia se ejecuta tal cual y
         # puede estar comparando el valor crudo: ahi se mandan las variantes.
-        if filters_by_sku and self.custom_query.strip():
+        if filters_by_sku and es_propia:
             a_buscar = list(dict.fromkeys(v for sku in unique for v in sku_variants(sku)))
         else:
             a_buscar = unique
@@ -584,9 +582,47 @@ class BigQueryStockSource:
         )
         if not filters_by_sku and not result.empty:
             result = result[result["sku"].isin(unique)].reset_index(drop=True)
-        result.attrs["skus_solicitados"] = len(unique)
-        result.attrs["tabla"] = self.table
         return result
+
+    def fetch(self, skus: Iterable[str]) -> pd.DataFrame:
+        unique = sorted({normalize_sku(sku) for sku in skus if normalize_sku(sku)})
+        if not unique:
+            return empty_stock_frame()
+
+        client = self._client()
+        propia = self.custom_query.strip()
+
+        # Si hay una consulta propia se intenta primero, pero **no se depende
+        # de ella**: se ejecuta tal cual, sin la canonizacion del SKU ni el
+        # corte por dia de la app, y una consulta desactualizada devuelve cero
+        # filas sin fallar. Antes eso dejaba la corrida sin stock y la unica
+        # salida era editar los secrets a mano. Ahora, si no trae ni una
+        # unidad, se reintenta con la consulta de la app y se deja anotado.
+        intentos: list[tuple[str, Any]] = []
+        if propia:
+            intentos.append(("propia", propia))
+        intentos.append(("de la app", self._built_in_marker))
+
+        primera_falla: Exception | None = None
+        ultimo = empty_stock_frame()
+        for indice, (nombre, query) in enumerate(intentos):
+            try:
+                result = self._run_query(client, query, unique)
+            except Exception as exc:
+                # Una consulta propia rota no debe tumbar la corrida si la de
+                # la app puede responder; si tampoco, se relanza el error real.
+                if indice + 1 < len(intentos):
+                    primera_falla = primera_falla or exc
+                    continue
+                raise primera_falla or exc
+            result.attrs["skus_solicitados"] = len(unique)
+            result.attrs["tabla"] = self.table
+            result.attrs["consulta_usada"] = nombre
+            result.attrs["consulta_propia_vacia"] = bool(propia) and nombre != "propia"
+            if int(result["stock"].sum() or 0) > 0 or indice + 1 == len(intentos):
+                return result
+            ultimo = result
+        return ultimo
 
     def diagnose(self, skus: Iterable[str]) -> dict[str, Any]:
         """Por que la consulta no trae stock. Solo lectura, sin traer datos.

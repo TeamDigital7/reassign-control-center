@@ -165,6 +165,109 @@ def test_sin_variantes_en_la_consulta_del_repo():
     assert "REGEXP_REPLACE(UPPER(TRIM(CAST(s.id_producto AS STRING)))" in consulta
 
 
+def _fuente_simulada(comportamiento, **kwargs):
+    """BigQueryStockSource con un cliente de BigQuery de mentira."""
+    import sys, types
+
+    bq = types.ModuleType("google.cloud.bigquery")
+    bq.QueryJobConfig = lambda **k: None
+    bq.ArrayQueryParameter = lambda *a, **k: None
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    cloud.bigquery = bq
+    google.cloud = cloud
+    sys.modules.setdefault("google", google)
+    sys.modules["google.cloud"] = cloud
+    sys.modules["google.cloud.bigquery"] = bq
+
+    from core.stock_source import BigQueryStockSource
+
+    class _Job:
+        def __init__(self, frame):
+            self.frame = frame
+
+        def result(self):
+            return self
+
+        def to_dataframe(self):
+            return self.frame
+
+    class _Cliente:
+        def query(self, query, job_config=None, location=None):
+            # La consulta del repo es la unica que arma el CTE `con_dia`.
+            return _Job(comportamiento("con_dia" not in query))
+
+        def get_table(self, table):
+            raise RuntimeError("sin esquema")
+
+    fuente = BigQueryStockSource(project_id="p", **kwargs)
+    fuente._client = lambda: _Cliente()
+    return fuente
+
+
+CON_STOCK = pd.DataFrame(
+    [{"sku": "5438957", "cod_tienda": "320", "stock_tiendas": 0,
+      "stock_bodega": 40, "fecha_corte": "2026-10-05"}]
+)
+PROPIA = "SELECT * FROM t WHERE sku IN UNNEST(@skus)"
+
+
+@case("Consulta propia: si funciona, se usa y no se consulta dos veces")
+def test_consulta_propia_funciona():
+    fuente = _fuente_simulada(
+        lambda propia: CON_STOCK if propia else pd.DataFrame(), custom_query=PROPIA
+    )
+    stock = fuente.fetch(["5438957"])
+    assert int(stock["stock"].sum()) == 40
+    assert stock.attrs["consulta_usada"] == "propia"
+    assert stock.attrs["consulta_propia_vacia"] is False
+
+
+@case("Consulta propia: si vuelve vacia, la app reintenta con la suya")
+def test_consulta_propia_vacia():
+    # Antes esto dejaba la corrida sin stock y la unica salida era editar los
+    # secrets a mano. La app ya no depende de eso.
+    fuente = _fuente_simulada(
+        lambda propia: pd.DataFrame() if propia else CON_STOCK, custom_query=PROPIA
+    )
+    stock = fuente.fetch(["5438957"])
+    assert int(stock["stock"].sum()) == 40, stock.to_dict("records")
+    assert stock.attrs["consulta_usada"] == "de la app"
+    assert stock.attrs["consulta_propia_vacia"] is True
+
+
+@case("Consulta propia: si revienta, tampoco tumba la corrida")
+def test_consulta_propia_rota():
+    def comportamiento(propia):
+        if propia:
+            raise RuntimeError("Unrecognized name: stock_disponible")
+        return CON_STOCK
+
+    stock = _fuente_simulada(comportamiento, custom_query=PROPIA).fetch(["5438957"])
+    assert int(stock["stock"].sum()) == 40
+    assert stock.attrs["consulta_usada"] == "de la app"
+
+
+@case("Consulta propia: si las dos fallan se relanza el error real")
+def test_ambas_fallan():
+    def comportamiento(propia):
+        raise RuntimeError("Unrecognized name: stock_disponible")
+
+    try:
+        _fuente_simulada(comportamiento, custom_query=PROPIA).fetch(["5438957"])
+    except RuntimeError as exc:
+        assert "stock_disponible" in str(exc), exc
+    else:
+        raise AssertionError("se esperaba el error de BigQuery")
+
+
+@case("Sin consulta propia se usa la del repo directamente")
+def test_sin_consulta_propia():
+    stock = _fuente_simulada(lambda propia: CON_STOCK).fetch(["5438957"])
+    assert stock.attrs["consulta_usada"] == "de la app"
+    assert stock.attrs["consulta_propia_vacia"] is False
+
+
 def main() -> int:
     passed, failed = 0, []
     for name, test in CASES:
