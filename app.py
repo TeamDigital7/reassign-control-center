@@ -397,11 +397,12 @@ def step_stock(config, mode: str) -> None:
     # tabla llena y desde la interfaz no habia forma de saberlo.
     if mode.startswith("BigQuery") and as_text(bigquery_secrets().get("stock_query")):
         ui.note(
-            "warn",
+            "info",
             "Los secrets traen una consulta de stock propia",
-            "La app la usa TAL CUAL, asi que no le aplica su canonizacion del SKU ni "
-            "su corte por dia. Si el stock no llega, quita `stock_query` del bloque "
-            "[bigquery] de los secrets para que la app use su propia consulta.",
+            "Se intenta primero esa, tal cual (sin la canonizacion del SKU ni el corte "
+            "por dia de la app). Si no devuelve ni una unidad, la app reintenta sola "
+            "con su propia consulta y lo avisa aqui. Para saltarla del todo, quita "
+            "`stock_query` del bloque [bigquery] de los secrets.",
         )
 
     if st.session_state.get("stock_error"):
@@ -478,14 +479,27 @@ def render_stock_diagnosis(skus: list[str], mode: str) -> None:
     )
     if not mode.startswith("BigQuery"):
         return
-    if not st.button("Diagnosticar fuente de stock"):
-        return
 
-    try:
-        with st.spinner("Revisando la tabla de stock..."):
-            datos = secrets_to_source(bigquery_secrets(), True).diagnose(skus)
-    except Exception as exc:
-        ui.note("bad", "No se pudo diagnosticar", str(exc))
+    # El diagnostico corre SOLO. Antes estaba detras de un boton y, cuando la
+    # corrida salia en cero, nadie lo pulsaba: la pantalla no decia por que y
+    # la respuesta estaba a un clic que no se daba. Se guarda en sesion para
+    # no repetir la consulta en cada interaccion de Streamlit.
+    firma = (tuple(skus), st.session_state.get("stock_skus") and True)
+    if st.session_state.get("diagnostico_firma") != firma:
+        try:
+            with st.spinner("Revisando la tabla de stock..."):
+                st.session_state["diagnostico"] = secrets_to_source(
+                    bigquery_secrets(), True
+                ).diagnose(skus)
+        except Exception as exc:
+            st.session_state["diagnostico"] = {"error": str(exc)}
+        st.session_state["diagnostico_firma"] = firma
+
+    datos = st.session_state.get("diagnostico") or {}
+    if datos.get("error"):
+        ui.note("bad", "No se pudo diagnosticar", datos["error"])
+        return
+    if not datos:
         return
 
     ui.kpi_grid(
@@ -575,6 +589,15 @@ def step_reassign(config, mode: str = "") -> None:
 
     # El stock es una foto: si la fuente trajo historico, se aviso cuantas
     # filas de cortes anteriores se dejaron fuera. Sumarlas inventaria stock.
+    if stock.attrs.get("consulta_propia_vacia"):
+        ui.note(
+            "warn",
+            "La consulta propia de los secrets no devolvio stock",
+            "Se uso la consulta de la app en su lugar y de ahi salen estos numeros. "
+            "Conviene revisar el `stock_query` de los secrets o quitarlo: mientras "
+            "siga ahi, cada corrida hace una consulta de mas.",
+        )
+
     anteriores = int(stock.attrs.get("filas_de_cortes_anteriores", 0))
     reemplazadas = int(stock.attrs.get("filas_reemplazadas_en_el_dia", 0))
     if anteriores or reemplazadas:
